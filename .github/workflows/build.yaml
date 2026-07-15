@@ -4,8 +4,8 @@ name: Build Android
 on:
   push:
     tags:
-      - 'v*'                # 推送 v 开头的标签时触发
-  workflow_dispatch:        # 允许在 Actions 页面手动触发
+      - 'v*'
+  workflow_dispatch:
 
 env:
   GRADLE_OPTS: -Dorg.gradle.vfs.watch=false
@@ -16,7 +16,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 定义要构建的架构
         include:
           - arch: arm64-v8a
             target: android-arm64
@@ -44,11 +43,12 @@ jobs:
         with:
           cmdline-tools-version: 11076708
 
+      # 修正点：使用 'stable' 自动获取最新稳定版，或指定有效版本如 '3.24.0'
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
-          flutter-version: '3.22.4'   # 使用稳定的 Flutter 版本
+          flutter-version: 'stable'   # 自动获取最新稳定版
           cache: true
 
       - name: Setup Go (如果需要)
@@ -65,14 +65,21 @@ jobs:
       - name: Get Flutter packages
         run: flutter pub get
 
+      - name: Run setup.dart (if exists)
+        run: |
+          if [ -f "setup.dart" ]; then
+            dart setup.dart android --arch ${{ matrix.arch }}
+          else
+            echo "setup.dart not found, skipping."
+          fi
+
       - name: Build APK for ${{ matrix.arch }}
         run: |
           cd android
           ./gradlew clean
-          # 使用 --split-per-abi 为每个架构生成独立的 APK
           flutter build apk --release --target-platform ${{ matrix.target }} --split-per-abi
 
-      - name: Build universal APK (only for arm64-v8a to avoid duplication)
+      - name: Build universal APK (only for arm64-v8a)
         if: matrix.arch == 'arm64-v8a'
         run: |
           cd android
@@ -83,9 +90,7 @@ jobs:
           mkdir -p dist
           VERSION=$(echo "${{ github.ref_name }}" | sed 's/^v//')
           
-          # 查找所有生成的 APK
           find android/app/build/outputs/apk -name "*.apk" -type f | while read apk; do
-            # 根据文件名确定架构
             if [[ "$apk" == *"arm64-v8a"* ]]; then
               cp "$apk" "dist/Bettbox-${VERSION}-android-arm64-v8a.apk"
             elif [[ "$apk" == *"armeabi-v7a"* ]]; then
@@ -93,15 +98,12 @@ jobs:
             elif [[ "$apk" == *"x86_64"* ]]; then
               cp "$apk" "dist/Bettbox-${VERSION}-android-x86_64.apk"
             elif [[ "$apk" == "app-release.apk" ]]; then
-              # 通用 APK
               cp "$apk" "dist/Bettbox-${VERSION}-android-universal.apk"
             else
-              # 其他情况，按原样复制
               cp "$apk" "dist/"
             fi
           done
           
-          # 查找 AAB（如果有）
           find android/app/build/outputs/bundle -name "*.aab" -type f | while read aab; do
             if [[ "$aab" == *"release"* ]]; then
               cp "$aab" "dist/Bettbox-${VERSION}-android.aab"
@@ -111,7 +113,7 @@ jobs:
           echo "Collected files:"
           ls -la dist/
 
-      - name: Upload artifacts (for debugging)
+      - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
           name: bettbox-android-${{ matrix.arch }}
@@ -125,7 +127,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    # 仅在标签推送时执行（手动触发不会执行 release）
     if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
@@ -142,7 +143,6 @@ jobs:
       - name: Prepare release files
         run: |
           mkdir -p release_files
-          # 将所有 APK 和 AAB 复制到 release_files
           find artifacts/ -type f \( -name "*.apk" -o -name "*.aab" \) -exec cp {} release_files/ \;
           echo "Release files:"
           ls -la release_files/
@@ -154,18 +154,15 @@ jobs:
           # Bettbox v${VERSION}
 
           ## 下载说明
-          请根据您的设备 CPU 架构选择对应的 APK：
           - **arm64-v8a**：绝大多数现代 Android 设备（推荐）
           - **armeabi-v7a**：较旧的 32 位设备
-          - **x86_64**：x86 架构设备（主要用于模拟器）
-          - **universal**：通用包（包含所有架构，体积较大）
-
-          如需上传 Google Play，请使用 **.aab** 文件。
+          - **x86_64**：x86 架构设备（模拟器）
+          - **universal**：通用包（体积较大）
+          - **.aab**：用于 Google Play 发布
 
           ## 更新内容
           - 自动构建 Android 版本
           - 修复与改进
-          - 具体变更请查看 Git 提交记录
           EOF
 
       - name: Create GitHub Release
@@ -175,4 +172,3 @@ jobs:
           body_path: release_notes.md
           draft: false
           prerelease: ${{ contains(github.ref_name, 'pre') }}
-          generate_release_notes: false
