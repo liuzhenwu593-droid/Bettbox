@@ -1,27 +1,32 @@
-name: build
+# .github/workflows/build-android.yml
+name: Build Android
 
 on:
   push:
     tags:
-      - 'v*'
+      - 'v*'                # 推送 v 开头的标签时触发
+  workflow_dispatch:        # 允许在 Actions 页面手动触发
 
 env:
-  IS_STABLE: ${{ !contains(github.ref, '-') }}
-  IS_PRERELEASE: ${{ contains(github.ref_name, 'pre') }}
-  SHOULD_RELEASE: ${{ !contains(github.ref, '-') || contains(github.ref_name, 'pre') }}
   GRADLE_OPTS: -Dorg.gradle.vfs.watch=false
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        arch: [arm64, amd64, arm, universal]
+        # 定义要构建的架构
+        include:
+          - arch: arm64-v8a
+            target: android-arm64
+          - arch: armeabi-v7a
+            target: android-arm
+          - arch: x86_64
+            target: android-x64
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v6
         with:
           submodules: recursive
@@ -30,165 +35,144 @@ jobs:
       - name: Setup Java
         uses: actions/setup-java@v5
         with:
-          distribution: temurin
+          distribution: 'temurin'
           java-version: '17'
           cache: 'gradle'
 
-      - name: Setup Golang
-        uses: actions/setup-go@v6
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
         with:
-          go-version: '1.24.x'
-          cache-dependency-path: core/go.sum
+          cmdline-tools-version: 11076708
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          channel: 'stable'
+          flutter-version: '3.22.4'   # 使用稳定的 Flutter 版本
           cache: true
-          cache-key: flutter-android-${{ matrix.arch }}-${{ hashFiles('**/pubspec.lock') }}
-          flutter-version: '3.44.5'
 
-      - name: Setup Android SDK
+      - name: Setup Go (如果需要)
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.21'
+          cache-dependency-path: core/go.sum
+
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build
+          sudo apt-get install -y ninja-build libgtk-3-dev pkg-config cmake
 
-      - name: Get Flutter Dependencies
-        run: |
-          flutter pub get
-          dart run build_runner build -d
+      - name: Get Flutter packages
+        run: flutter pub get
 
-      - name: Build Android APK
-        run: |
-          # 构建特定架构的 APK
-          cd android
-          if [ "${{ matrix.arch }}" == "universal" ]; then
-            ./gradlew assembleRelease
-          else
-            # 使用 abiFilters 构建特定架构
-            flutter build apk --release --target-platform android-${{ matrix.arch == 'arm64' && 'arm64' || matrix.arch == 'amd64' && 'x64' || matrix.arch == 'arm' && 'arm' || 'android' }} --split-per-abi
-          fi
-
-      - name: Build Android App Bundle
+      - name: Build APK for ${{ matrix.arch }}
         run: |
           cd android
-          if [ "${{ matrix.arch }}" == "universal" ]; then
-            ./gradlew bundleRelease
-          fi
+          ./gradlew clean
+          # 使用 --split-per-abi 为每个架构生成独立的 APK
+          flutter build apk --release --target-platform ${{ matrix.target }} --split-per-abi
 
-      - name: Prepare Dist Directory
+      - name: Build universal APK (only for arm64-v8a to avoid duplication)
+        if: matrix.arch == 'arm64-v8a'
+        run: |
+          cd android
+          flutter build apk --release
+
+      - name: Collect artifacts
         run: |
           mkdir -p dist
           VERSION=$(echo "${{ github.ref_name }}" | sed 's/^v//')
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-
-      - name: Collect APK Files
-        run: |
-          VERSION="${{ env.VERSION }}"
-          APK_DIR="android/app/build/outputs/apk/release"
-          AAB_DIR="android/app/build/outputs/bundle/release"
           
-          # 处理 APK 文件
-          if [ -d "$APK_DIR" ]; then
-            for apk in "$APK_DIR"/*.apk; do
-              if [ -f "$apk" ]; then
-                # 根据文件名判断架构
-                if [[ "$apk" == *"arm64"* ]]; then
-                  ARCH="arm64"
-                elif [[ "$apk" == *"x86_64"* ]] || [[ "$apk" == *"x64"* ]]; then
-                  ARCH="amd64"
-                elif [[ "$apk" == *"armeabi"* ]]; then
-                  ARCH="arm"
-                else
-                  ARCH="${{ matrix.arch }}"
-                fi
-                cp "$apk" "dist/Bettbox-${VERSION}-android-${ARCH}.apk"
-              fi
-            done
-          fi
-          
-          # 如果没有找到分架构的 APK，说明是 universal
-          if [ ! "$(ls -A dist/*.apk 2>/dev/null)" ] && [ -f "$APK_DIR/app-release.apk" ]; then
-            cp "$APK_DIR/app-release.apk" "dist/Bettbox-${VERSION}-android-universal.apk"
-          fi
-          
-          # 处理 AAB 文件
-          if [ -f "$AAB_DIR/app-release.aab" ]; then
-            cp "$AAB_DIR/app-release.aab" "dist/Bettbox-${VERSION}-android-universal.aab"
-          fi
-
-      - name: Fallback APK Collection
-        if: always()
-        run: |
-          VERSION="${{ env.VERSION }}"
-          # 如果 dist 为空，尝试直接复制
-          if [ -z "$(ls -A dist 2>/dev/null)" ]; then
-            echo "No APK files found, trying fallback..."
-            APK_DIR="android/app/build/outputs/apk/release"
-            if [ -f "$APK_DIR/app-release.apk" ]; then
-              cp "$APK_DIR/app-release.apk" "dist/Bettbox-${VERSION}-android-${{ matrix.arch }}.apk"
+          # 查找所有生成的 APK
+          find android/app/build/outputs/apk -name "*.apk" -type f | while read apk; do
+            # 根据文件名确定架构
+            if [[ "$apk" == *"arm64-v8a"* ]]; then
+              cp "$apk" "dist/Bettbox-${VERSION}-android-arm64-v8a.apk"
+            elif [[ "$apk" == *"armeabi-v7a"* ]]; then
+              cp "$apk" "dist/Bettbox-${VERSION}-android-armeabi-v7a.apk"
+            elif [[ "$apk" == *"x86_64"* ]]; then
+              cp "$apk" "dist/Bettbox-${VERSION}-android-x86_64.apk"
+            elif [[ "$apk" == "app-release.apk" ]]; then
+              # 通用 APK
+              cp "$apk" "dist/Bettbox-${VERSION}-android-universal.apk"
+            else
+              # 其他情况，按原样复制
+              cp "$apk" "dist/"
             fi
-          fi
+          done
+          
+          # 查找 AAB（如果有）
+          find android/app/build/outputs/bundle -name "*.aab" -type f | while read aab; do
+            if [[ "$aab" == *"release"* ]]; then
+              cp "$aab" "dist/Bettbox-${VERSION}-android.aab"
+            fi
+          done
+          
+          echo "Collected files:"
+          ls -la dist/
 
-      - name: List Built Files
-        run: |
-          echo "Built files:"
-          find android/app/build/outputs -name "*.apk" -o -name "*.aab" | sort
-          echo ""
-          echo "Dist directory:"
-          ls -la dist/ || echo "No files in dist"
-
-      - name: Upload Artifacts
+      - name: Upload artifacts (for debugging)
         uses: actions/upload-artifact@v6
         with:
-          name: Bettbox-android-${{ matrix.arch }}
-          path: ./dist
+          name: bettbox-android-${{ matrix.arch }}
+          path: dist/
           compression-level: 9
-          overwrite: true
           retention-days: 30
+          if-no-files-found: warn
 
-  upload:
-    permissions: write-all
-    needs: [ build ]
+  release:
+    needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # 仅在标签推送时执行（手动触发不会执行 release）
+    if: startsWith(github.ref, 'refs/tags/v')
+
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
 
-      - name: Download All Artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v7
         with:
-          path: ./all-artifacts/
-          pattern: Bettbox-android-*
+          path: artifacts/
+          pattern: bettbox-android-*
           merge-multiple: true
 
-      - name: Organize Release Files
+      - name: Prepare release files
         run: |
-          mkdir -p dist
-          # 移动所有文件到 dist
-          if [ -d "./all-artifacts" ]; then
-            find ./all-artifacts -type f -name "*.apk" -o -name "*.aab" | while read file; do
-              mv "$file" ./dist/
-            done
-          fi
-          echo "Files ready for release:"
-          ls -la ./dist/
+          mkdir -p release_files
+          # 将所有 APK 和 AAB 复制到 release_files
+          find artifacts/ -type f \( -name "*.apk" -o -name "*.aab" \) -exec cp {} release_files/ \;
+          echo "Release files:"
+          ls -la release_files/
 
-      - name: Generate release.md
+      - name: Generate release notes
         run: |
-          echo "## Changelog" > release.md
-          echo "" >> release.md
-          echo "- Android build for version ${{ github.ref_name }}" >> release.md
-          echo "- Fixes and improvements" >> release.md
-          echo "- 具体变更参考最新 Commits" >> release.md
+          VERSION=$(echo "${{ github.ref_name }}" | sed 's/^v//')
+          cat > release_notes.md << EOF
+          # Bettbox v${VERSION}
 
-      - name: Create Release
-        if: ${{ env.SHOULD_RELEASE == 'true' }}
-        uses: softprops/action-gh-release@v3.0.0
+          ## 下载说明
+          请根据您的设备 CPU 架构选择对应的 APK：
+          - **arm64-v8a**：绝大多数现代 Android 设备（推荐）
+          - **armeabi-v7a**：较旧的 32 位设备
+          - **x86_64**：x86 架构设备（主要用于模拟器）
+          - **universal**：通用包（包含所有架构，体积较大）
+
+          如需上传 Google Play，请使用 **.aab** 文件。
+
+          ## 更新内容
+          - 自动构建 Android 版本
+          - 修复与改进
+          - 具体变更请查看 Git 提交记录
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
         with:
-          files: ./dist/*
-          body_path: './release.md'
-          prerelease: ${{ env.IS_PRERELEASE == 'true' }}
+          files: release_files/*
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'pre') }}
           generate_release_notes: false
