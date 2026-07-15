@@ -11,57 +11,14 @@ env:
   SHOULD_RELEASE: ${{ !contains(github.ref, '-') || contains(github.ref_name, 'pre') }}
   GRADLE_OPTS: -Dorg.gradle.vfs.watch=false
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  SENTRY_BACKEND: none
-  
+
 jobs:
   build:
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: android
-            os: ubuntu-24.04
-            arch: arm64
-          - platform: android
-            os: ubuntu-24.04
-            arch: amd64
-          - platform: android
-            os: ubuntu-24.04
-            arch: arm
-          - platform: android
-            os: ubuntu-24.04
-            arch: universal
-          - platform: windows
-            os: windows-2022
-            arch: amd64
-          - platform: windows
-            os: windows-11-arm
-            arch: arm64
-          - platform: windows
-            os: windows-2022
-            arch: amd64
-            compatible: true
-          - platform: macos
-            os: macos-15
-            arch: arm64
-          - platform: macos
-            os: macos-15
-            arch: amd64
-          - platform: macos
-            os: macos-15
-            arch: amd64
-            compatible: true
-          - platform: linux
-            os: ubuntu-22.04
-            arch: amd64
-          - platform: linux
-            os: ubuntu-24.04-arm
-            arch: arm64
-          - platform: linux
-            os: ubuntu-22.04
-            arch: amd64
-            compatible: true
+        arch: [arm64, amd64, arm, universal]
 
     steps:
       - name: Checkout
@@ -70,247 +27,125 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Setup Rust (Windows)
-        if: matrix.platform == 'windows'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.arch == 'arm64' && 'aarch64-pc-windows-msvc' || 'x86_64-pc-windows-msvc' }}
-
-      - name: Enable Git long paths (Windows)
-        if: matrix.platform == 'windows'
-        run: git config --global core.longpaths true
-
-      - name: Setup Keystore (Android)
-        if: matrix.platform == 'android'
-        run: |
-          echo "${{ secrets.KEYSTORE }}" | base64 --decode > android/app/keystore.jks
-          echo "keyAlias=${{ secrets.KEY_ALIAS }}" >> android/local.properties
-          echo "storePassword=${{ secrets.STORE_PASSWORD }}" >> android/local.properties
-          echo "keyPassword=${{ secrets.KEY_PASSWORD }}" >> android/local.properties
-          
-      - name: Setup Java (Android)
-        if: matrix.platform == 'android'
+      - name: Setup Java
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
           cache: 'gradle'
 
-      - name: Install Dependencies (Linux)
-        if: matrix.platform == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libcurl4-openssl-dev ninja-build libgtk-3-dev rpm
-
       - name: Setup Golang
         uses: actions/setup-go@v6
         with:
-          go-version: ${{ matrix.compatible == true && '1.20.x' || '1.24.x' }}
+          go-version: '1.24.x'
           cache-dependency-path: core/go.sum
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: ${{ contains(matrix.os, 'arm') && 'master' || 'stable' }}
+          channel: stable
           cache: true
-          cache-key: flutter-${{ matrix.platform }}-${{ matrix.arch }}-${{ hashFiles('**/pubspec.lock') }}
-          flutter-version: ${{ contains(matrix.os, 'arm') && '' || '3.44.5' }}
+          cache-key: flutter-android-${{ matrix.arch }}-${{ hashFiles('**/pubspec.lock') }}
+          flutter-version: '3.44.5'
 
+      - name: Setup Android SDK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
 
-      - name: Clean Gradle (Android)
-        if: matrix.platform == 'android'
+      - name: Get Flutter Dependencies
+        run: |
+          flutter pub get
+          dart run build_runner build -d
+
+      - name: Build Android APK
+        run: |
+          # 构建特定架构的 APK
+          cd android
+          if [ "${{ matrix.arch }}" == "universal" ]; then
+            ./gradlew assembleRelease
+          else
+            # 使用 abiFilters 构建特定架构
+            flutter build apk --release --target-platform android-${{ matrix.arch == 'arm64' && 'arm64' || matrix.arch == 'amd64' && 'x64' || matrix.arch == 'arm' && 'arm' || 'android' }} --split-per-abi
+          fi
+
+      - name: Build Android App Bundle
         run: |
           cd android
-          flutter clean
+          if [ "${{ matrix.arch }}" == "universal" ]; then
+            ./gradlew bundleRelease
+          fi
 
-      - name: Patch for Windows
-        if: matrix.platform == 'windows'
-        shell: bash
+      - name: Prepare Dist Directory
         run: |
-          cd core
-          SING_TUN_VERSION=$(grep -E 'github\.com/metacubex/sing-tun\s+v[^[:space:]]+' go.mod | awk '{print $2}')
-          echo "Detected sing-tun version: ${SING_TUN_VERSION}"
-          go mod download github.com/metacubex/sing-tun@${SING_TUN_VERSION}
-          MOD_CACHE=$(go env GOMODCACHE | tr '\\' '/')
-          FILE="${MOD_CACHE}/github.com/metacubex/sing-tun@${SING_TUN_VERSION}/tun_windows.go"
-          echo "Patching ${FILE}"
-          chmod +w "${FILE}"
-          perl -pi -e 's/inetIf\.ForwardingEnabled = true/inetIf.ForwardingEnabled = false/g' "${FILE}"
+          mkdir -p dist
+          VERSION=$(echo "${{ github.ref_name }}" | sed 's/^v//')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
 
-      - name: Build Bettbox (Non-Windows)
-        if: matrix.platform != 'windows'
-        shell: bash
-        env:
-          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+      - name: Collect APK Files
         run: |
-          flutter pub get
-          dart run build_runner build -d
-          dart setup.dart ${{ matrix.platform }} --arch ${{ matrix.arch }} ${{ env.IS_STABLE == 'true' && '--env stable' || '' }} ${{ matrix.compatible == true && '--compatible' || '' }}
-
-      - name: Install SignPath (Windows)
-        if: matrix.platform == 'windows'
-        shell: pwsh
-        env:
-          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
-        run: |
-          if (-not $env:SIGNPATH_API_TOKEN) {
-            Write-Host "SIGNPATH_API_TOKEN is not configured. Skipping module installation."
-            exit 0
-          }
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-          Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted
-          Install-Module -Name SignPath -Force -Scope CurrentUser -Repository PSGallery
-
-      - name: Set Signing Policy Slug (Windows)
-        if: matrix.platform == 'windows'
-        shell: pwsh
-        run: |
-          $slug = if ('${{ env.IS_STABLE }}' -eq 'true') { "release-signing" } else { "test-signing" }
-          Write-Host "Setting SIGNING_POLICY_SLUG to $slug"
-          "SIGNING_POLICY_SLUG=$slug" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Build Core (Windows)
-        if: matrix.platform == 'windows'
-        shell: bash
-        run: |
-          flutter pub get
-          dart run build_runner build -d
-          dart setup.dart windows --arch ${{ matrix.arch }} --out core-only ${{ matrix.compatible == true && '--compatible' || '' }}
-
-      - name: Sign Core (Windows)
-        if: matrix.platform == 'windows'
-        shell: pwsh
-        env:
-          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
-        run: |
-          if (-not $env:SIGNPATH_API_TOKEN) {
-            Write-Warning "SIGNPATH_API_TOKEN is not set. Skipping Core signing."
-            exit 0
-          }
+          VERSION="${{ env.VERSION }}"
+          APK_DIR="android/app/build/outputs/apk/release"
+          AAB_DIR="android/app/build/outputs/bundle/release"
           
-          Submit-SigningRequest `
-            -InputArtifactPath "libclash/windows/BettboxCore.exe" `
-            -ApiToken "$env:SIGNPATH_API_TOKEN" `
-            -OrganizationId "0d3f8e8e-3f4d-4ac8-ab3f-d6c5c110ab0d" `
-            -ProjectSlug "Bettbox" `
-            -SigningPolicySlug "$env:SIGNING_POLICY_SLUG" `
-            -OutputArtifactPath "libclash/windows/BettboxCore.exe" `
-            -WaitForCompletion `
-            -Force
-
-      - name: Build HelperService (Windows)
-        if: matrix.platform == 'windows'
-        shell: pwsh
-        run: |
-          $signedCoreHash = (Get-FileHash libclash/windows/BettboxCore.exe -Algorithm SHA256).Hash.ToLower()
-          Write-Host "Signed Core SHA256 (TOKEN for Helper): $signedCoreHash"
-          dart setup.dart windows --arch ${{ matrix.arch }} --out helper --core-hash $signedCoreHash ${{ matrix.compatible == true && '--compatible' || '' }}
-
-      - name: Sign HelperService (Windows)
-        if: matrix.platform == 'windows'
-        shell: pwsh
-        env:
-          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
-        run: |
-          if (-not $env:SIGNPATH_API_TOKEN) {
-            Write-Warning "SIGNPATH_API_TOKEN is not set. Skipping Helper signing."
-            exit 0
-          }
+          # 处理 APK 文件
+          if [ -d "$APK_DIR" ]; then
+            for apk in "$APK_DIR"/*.apk; do
+              if [ -f "$apk" ]; then
+                # 根据文件名判断架构
+                if [[ "$apk" == *"arm64"* ]]; then
+                  ARCH="arm64"
+                elif [[ "$apk" == *"x86_64"* ]] || [[ "$apk" == *"x64"* ]]; then
+                  ARCH="amd64"
+                elif [[ "$apk" == *"armeabi"* ]]; then
+                  ARCH="arm"
+                else
+                  ARCH="${{ matrix.arch }}"
+                fi
+                cp "$apk" "dist/Bettbox-${VERSION}-android-${ARCH}.apk"
+              fi
+            done
+          fi
           
-          Submit-SigningRequest `
-            -InputArtifactPath "libclash/windows/BettboxHelperService.exe" `
-            -ApiToken "$env:SIGNPATH_API_TOKEN" `
-            -OrganizationId "0d3f8e8e-3f4d-4ac8-ab3f-d6c5c110ab0d" `
-            -ProjectSlug "Bettbox" `
-            -SigningPolicySlug "$env:SIGNING_POLICY_SLUG" `
-            -OutputArtifactPath "libclash/windows/BettboxHelperService.exe" `
-            -WaitForCompletion `
-            -Force
+          # 如果没有找到分架构的 APK，说明是 universal
+          if [ ! "$(ls -A dist/*.apk 2>/dev/null)" ] && [ -f "$APK_DIR/app-release.apk" ]; then
+            cp "$APK_DIR/app-release.apk" "dist/Bettbox-${VERSION}-android-universal.apk"
+          fi
+          
+          # 处理 AAB 文件
+          if [ -f "$AAB_DIR/app-release.aab" ]; then
+            cp "$AAB_DIR/app-release.aab" "dist/Bettbox-${VERSION}-android-universal.aab"
+          fi
 
-      - name: Build Bettbox (Windows)
-        if: matrix.platform == 'windows'
-        shell: pwsh
-        env:
-          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+      - name: Fallback APK Collection
+        if: always()
         run: |
-          $coreHash = (Get-FileHash libclash/windows/BettboxCore.exe -Algorithm SHA256).Hash.ToLower()
-          Write-Host "Core SHA256: $coreHash"
-          
-          $desc = if ('${{ matrix.compatible }}' -eq 'true') { "${{ matrix.arch }}-compatible" } else { "${{ matrix.arch }}" }
-          $appEnv = if ('${{ env.IS_STABLE }}' -eq 'true') { "stable" } else { "pre" }
-          
-          $flutterArgs = @(
-            "build", "windows", "--release", "--verbose",
-            "--dart-define=CORE_SHA256=$coreHash",
-            "--dart-define=APP_ENV=$appEnv",
-            "--dart-define=APP_ASSET_SUFFIX=windows-$desc-setup.exe"
-          )
-          if ($env:SENTRY_DSN) {
-            $flutterArgs += "--dart-define=SENTRY_DSN=$env:SENTRY_DSN"
-          }
-          
-          flutter @flutterArgs
+          VERSION="${{ env.VERSION }}"
+          # 如果 dist 为空，尝试直接复制
+          if [ -z "$(ls -A dist 2>/dev/null)" ]; then
+            echo "No APK files found, trying fallback..."
+            APK_DIR="android/app/build/outputs/apk/release"
+            if [ -f "$APK_DIR/app-release.apk" ]; then
+              cp "$APK_DIR/app-release.apk" "dist/Bettbox-${VERSION}-android-${{ matrix.arch }}.apk"
+            fi
+          fi
 
-      - name: Sign Bettbox (Windows)
-        if: matrix.platform == 'windows'
-        shell: pwsh
-        env:
-          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+      - name: List Built Files
         run: |
-          if (-not $env:SIGNPATH_API_TOKEN) {
-            Write-Warning "SIGNPATH_API_TOKEN is not set. Skipping Bettbox runner signing."
-            exit 0
-          }
-          $buildDir = if ('${{ matrix.arch }}' -eq 'arm64') { "arm64" } else { "x64" }
-          $runnerExe = "build/windows/$buildDir/runner/Release/Bettbox.exe"
-          
-          # Submit to SignPath directly
-          Submit-SigningRequest `
-            -InputArtifactPath "$runnerExe" `
-            -ApiToken "$env:SIGNPATH_API_TOKEN" `
-            -OrganizationId "0d3f8e8e-3f4d-4ac8-ab3f-d6c5c110ab0d" `
-            -ProjectSlug "Bettbox" `
-            -SigningPolicySlug "$env:SIGNING_POLICY_SLUG" `
-            -OutputArtifactPath "$runnerExe" `
-            -WaitForCompletion `
-            -Force
+          echo "Built files:"
+          find android/app/build/outputs -name "*.apk" -o -name "*.aab" | sort
+          echo ""
+          echo "Dist directory:"
+          ls -la dist/ || echo "No files in dist"
 
-      - name: Package Windows Application
-        if: matrix.platform == 'windows'
-        shell: bash
-        run: |
-          dart windows/packaging/exe/package_windows.dart --arch ${{ matrix.arch }} ${{ matrix.compatible == true && '--compatible' || '' }} --env ${{ env.IS_STABLE == 'true' && 'stable' || 'pre' }}
-
-      - name: Sign Installer (Windows)
-        if: matrix.platform == 'windows'
-        shell: pwsh
-        env:
-          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
-        run: |
-          if (-not $env:SIGNPATH_API_TOKEN) {
-            Write-Warning "SIGNPATH_API_TOKEN is not set. Skipping Installer signing."
-            exit 0
-          }
-          $desc = if ('${{ matrix.compatible }}' -eq 'true') { "${{ matrix.arch }}-compatible" } else { "${{ matrix.arch }}" }
-          $installer = (Resolve-Path "dist/Bettbox-*-windows-$desc-setup.exe").Path
-          
-          Submit-SigningRequest `
-            -InputArtifactPath "$installer" `
-            -ApiToken "$env:SIGNPATH_API_TOKEN" `
-            -OrganizationId "0d3f8e8e-3f4d-4ac8-ab3f-d6c5c110ab0d" `
-            -ProjectSlug "Bettbox" `
-            -SigningPolicySlug "$env:SIGNING_POLICY_SLUG" `
-            -OutputArtifactPath "$installer" `
-            -WaitForCompletion `
-            -Force
-      
       - name: Upload Artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: Bettbox-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.compatible == true && '-compatible' || '' }}
+          name: Bettbox-android-${{ matrix.arch }}
           path: ./dist
           compression-level: 9
           overwrite: true
+          retention-days: 30
 
   upload:
     permissions: write-all
@@ -322,31 +157,38 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download
+      - name: Download All Artifacts
         uses: actions/download-artifact@v7
         with:
-          path: ./dist/
-          pattern: Bettbox-*
+          path: ./all-artifacts/
+          pattern: Bettbox-android-*
           merge-multiple: true
+
+      - name: Organize Release Files
+        run: |
+          mkdir -p dist
+          # 移动所有文件到 dist
+          if [ -d "./all-artifacts" ]; then
+            find ./all-artifacts -type f -name "*.apk" -o -name "*.aab" | while read file; do
+              mv "$file" ./dist/
+            done
+          fi
+          echo "Files ready for release:"
+          ls -la ./dist/
 
       - name: Generate release.md
         run: |
-          echo -e "- Fixes and improvements\n- 具体变更参考最新Commits" > release.md
+          echo "## Changelog" > release.md
+          echo "" >> release.md
+          echo "- Android build for version ${{ github.ref_name }}" >> release.md
+          echo "- Fixes and improvements" >> release.md
+          echo "- 具体变更参考最新 Commits" >> release.md
 
-      - name: Patch release.md
-        run: |
-          version=$(echo "${{ github.ref_name }}" | sed 's/^v//')
-          base_version=$(echo "$version" | sed 's/-pre[0-9]*//')
-          if [ "${{ env.IS_PRERELEASE }}" == "true" ]; then
-            sed -e "s|BASE_VERSION|$base_version|g" -e "s|VERSION|$version|g" ./.github/release_template_pre.md >> release.md
-          else
-            sed -e "s|BASE_VERSION|$base_version|g" -e "s|VERSION|$version|g" ./.github/release_template.md >> release.md
-          fi
-
-      - name: Release
+      - name: Create Release
         if: ${{ env.SHOULD_RELEASE == 'true' }}
         uses: softprops/action-gh-release@v3.0.0
         with:
           files: ./dist/*
           body_path: './release.md'
           prerelease: ${{ env.IS_PRERELEASE == 'true' }}
+          generate_release_notes: false
